@@ -3235,8 +3235,13 @@ async fn op_fetch_url(
             client
         };
         if let Some(stealth) = stealth {
+            let shared = {
+                let st = state.borrow();
+                st.borrow::<SharedState>().clone()
+            };
             return stealth_fetch_all(
                 stealth,
+                shared,
                 url.clone(),
                 req_method.as_str().to_string(),
                 custom_headers.clone(),
@@ -3508,49 +3513,16 @@ async fn op_fetch_url(
     let response_request_id = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        gs.network_response_body_counter += 1;
-        let request_id = format!("fetch-{}", gs.network_response_body_counter);
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                StoredNetworkResponseBody {
-                    body: resp_body.clone(),
-                    base64_encoded: false,
-                },
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        // Record a network event so the CDP layer emits requestWillBeSent /
-        // responseReceived for this script-initiated request (#406). Keyed by
-        // the same fetch-{N} id as the stored body so Network.getResponseBody
-        // resolves. Capped to keep a long-lived page from growing unbounded.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            url: current_url.clone(),
-            method: current_method.as_str().to_string(),
+        drop(state_borrow);
+        record_js_network_response(
+            &gs,
+            &current_url,
+            current_method.as_str(),
             status,
-            response_headers: resp_headers.clone(),
-            body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
+            &resp_headers,
+            &resp_body,
+            resp_bytes.len(),
+        )
     };
 
     tracing::debug!(
@@ -3605,9 +3577,72 @@ fn fetch_response(
 /// handling lives inside StealthHttpClient::send_single, which shares the
 /// context jar. Response bodies are not mirrored into the CDP
 /// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+/// Record a script-initiated response so the CDP layer can emit
+/// Network.requestWillBeSent / responseReceived for it, and so
+/// Network.getResponseBody resolves against the same `fetch-{N}` id (#406).
+///
+/// Shared by BOTH scripted-fetch transports. The stealth transport used to
+/// return before reaching the recorder in `op_fetch_url`, so with
+/// `--features stealth` every fetch()/XHR the page made — including a form POST
+/// to an exfil collector — executed normally and was invisible to every CDP
+/// client (#977). Keeping one recorder is what stops the two transports from
+/// drifting apart again.
+fn record_js_network_response(
+    shared: &SharedState,
+    url: &str,
+    method: &str,
+    status: u16,
+    resp_headers: &HashMap<String, String>,
+    resp_body: &str,
+    resp_len: usize,
+) -> String {
+    let mut gs = shared.borrow_mut();
+    gs.network_response_body_counter += 1;
+    let request_id = format!("fetch-{}", gs.network_response_body_counter);
+    let max_entries = response_body_entry_limit();
+    let max_bytes = response_body_byte_limit();
+    if max_entries > 0 && max_bytes > 0 && resp_len <= max_bytes {
+        gs.network_response_bodies.insert(
+            request_id.clone(),
+            StoredNetworkResponseBody {
+                body: resp_body.to_string(),
+                base64_encoded: false,
+            },
+        );
+        gs.network_response_body_order.push_back(request_id.clone());
+        while gs.network_response_body_order.len() > max_entries {
+            if let Some(oldest) = gs.network_response_body_order.pop_front() {
+                gs.network_response_bodies.remove(&oldest);
+            }
+        }
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    gs.js_network_events.push(JsNetworkEvent {
+        request_id: request_id.clone(),
+        url: url.to_string(),
+        method: method.to_string(),
+        status,
+        response_headers: resp_headers.clone(),
+        body_size: resp_len,
+        timestamp,
+    });
+    const MAX_JS_NETWORK_EVENTS: usize = 4096;
+    if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+        let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+        gs.js_network_events.drain(0..overflow);
+    }
+    request_id
+}
+
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     stealth: Arc<StealthHttpClient>,
+    // The same handle `op_fetch_url` records against, so this transport can
+    // reach the shared recorder instead of returning past it (#977).
+    shared: SharedState,
     url: String,
     method: String,
     custom_headers: HashMap<String, String>,
@@ -3802,6 +3837,20 @@ async fn stealth_fetch_all(
     } else {
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
+
+    // Surface this request to CDP before returning. An opaque (no-cors,
+    // cross-origin) response still HAPPENED, so it is recorded with the status
+    // and body the script is allowed to see — a scanner must be able to tell
+    // "the page made this request" from "the page made no request" (#977).
+    record_js_network_response(
+        &shared,
+        &current_url,
+        &current_method,
+        if opaque { 0 } else { status },
+        &script_headers,
+        if opaque { "" } else { resp_body.as_str() },
+        if opaque { 0 } else { resp_bytes.len() },
+    );
 
     Ok(serde_json::json!({
         "status": if opaque { 0 } else { status },
