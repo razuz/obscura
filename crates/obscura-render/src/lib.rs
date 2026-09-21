@@ -1413,6 +1413,9 @@ pub struct LayoutStyle {
     /// a real inherited CSS property). Resolved into `effectively_invisible`
     /// during `dom::layout_dom`'s inheritance pass.
     pub visibility_hidden: Option<bool>,
+    /// Computed `pointer-events: none|auto`. The property is inherited, so
+    /// `None` means the top-down style pass still needs the parent's value.
+    pub pointer_events_none: Option<bool>,
     /// `opacity`, own (non-inherited) value in 0.0-1.0. `None` means the
     /// default of 1.0.
     pub opacity: Option<f32>,

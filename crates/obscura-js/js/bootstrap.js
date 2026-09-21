@@ -101,21 +101,14 @@ globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.prevent
 globalThis.onerror = function(msg, src, line, col, error) {
   globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
 };
-globalThis.__windowListeners = {};
-globalThis.addEventListener = function(type, fn) {
-  if (!globalThis.__windowListeners[type]) globalThis.__windowListeners[type] = [];
-  globalThis.__windowListeners[type].push(fn);
+globalThis.addEventListener = function(type, fn, options) {
+  _eventTargetAdd(globalThis, type, fn, options);
 };
-globalThis.removeEventListener = function(type, fn) {
-  if (globalThis.__windowListeners[type]) {
-    globalThis.__windowListeners[type] = globalThis.__windowListeners[type].filter(h => h !== fn);
-  }
+globalThis.removeEventListener = function(type, fn, options) {
+  _eventTargetRemove(globalThis, type, fn, options);
 };
 globalThis.dispatchEvent = function(event) {
-  if (!event) return true;
-  const handlers = globalThis.__windowListeners[event.type] || [];
-  for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
-  return !event.defaultPrevented;
+  return _eventTargetDispatch(globalThis, event);
 };
 
 let _domMutationEpoch = 0;
@@ -1914,26 +1907,129 @@ function _eventTargetDispatch(target, event) {
   if (String(event.type) === "") {
     throw new DOMException("The event's type was not specified.", "InvalidStateError");
   }
-  if (!event.target) event.target = target;
+  if (event._dispatching) {
+    throw new DOMException("The event is already being dispatched.", "InvalidStateError");
+  }
+  event._dispatching = true;
+  event._propagationStopped = false;
+  event._immediatePropagationStopped = false;
+  event.target = target;
   event.currentTarget = target;
   event.eventPhase = 2;
+  try {
+    const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
+    for (const entry of listeners) {
+      const current = _eventTargetListeners.get(target)?.get(String(event.type));
+      if (!current || !current.includes(entry)) continue;
+      if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
+      const callback = entry.callback;
+      try {
+        if (typeof callback === "function") callback.call(target, event);
+        else callback.handleEvent.call(callback, event);
+      } catch (error) {
+        console.error(error);
+      }
+      if (event._immediatePropagationStopped) break;
+    }
+    return !event.defaultPrevented;
+  } finally {
+    event.currentTarget = null;
+    event.eventPhase = 0;
+    event._dispatching = false;
+  }
+}
+
+function _domEventInvoke(target, event, capture, phase) {
+  event.currentTarget = target;
+  event.eventPhase = phase;
+
+  // Content attributes and IDL event handlers participate in the non-capture
+  // listener group. Keep their existing position ahead of listeners installed
+  // through addEventListener; changing that ordering here would be an unrelated
+  // compatibility change.
+  if (!capture && typeof target._resolveInlineHandler === "function") {
+    const handlerName = "on" + event.type;
+    const inlineFn = target[handlerName] || target._resolveInlineHandler(handlerName);
+    if (typeof inlineFn === "function") {
+      try {
+        if (inlineFn.call(target, event) === false) event.preventDefault();
+      } catch (error) {
+        console.error(error);
+      }
+    }
+  }
+
   const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
   for (const entry of listeners) {
+    if (entry.capture !== capture) continue;
     const current = _eventTargetListeners.get(target)?.get(String(event.type));
     if (!current || !current.includes(entry)) continue;
     if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
-    const callback = entry.callback;
     try {
-      if (typeof callback === "function") callback.call(target, event);
-      else callback.handleEvent.call(callback, event);
+      if (typeof entry.callback === "function") entry.callback.call(target, event);
+      else entry.callback.handleEvent.call(entry.callback, event);
     } catch (error) {
       console.error(error);
     }
     if (event._immediatePropagationStopped) break;
   }
-  event.currentTarget = null;
-  event.eventPhase = 0;
-  return !event.defaultPrevented;
+}
+
+// DOM events have one propagation path. The old Element implementation
+// recursively called parent.dispatchEvent(), which discarded capture options
+// and left eventPhase at NONE. Delegated framework handlers depend on capture
+// running before target/bubble listeners, so build the path once and dispatch
+// each phase explicitly.
+function _domEventDispatch(target, event) {
+  if (!event || typeof event.type === "undefined") {
+    throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
+  }
+  if (String(event.type) === "") {
+    throw new DOMException("The event's type was not specified.", "InvalidStateError");
+  }
+  if (event._dispatching) {
+    throw new DOMException("The event is already being dispatched.", "InvalidStateError");
+  }
+
+  event._dispatching = true;
+  event._propagationStopped = false;
+  event._immediatePropagationStopped = false;
+  event.target = target;
+  const path = [];
+  let ancestor = target.parentNode || null;
+  while (ancestor) {
+    path.push(ancestor);
+    ancestor = ancestor.parentNode || null;
+  }
+  if (target !== globalThis && path[path.length - 1] !== globalThis) {
+    path.push(globalThis);
+  }
+
+  try {
+    for (let index = path.length - 1; index >= 0; index--) {
+      _domEventInvoke(path[index], event, true, 1);
+      if (event._propagationStopped) break;
+    }
+
+    if (!event._propagationStopped) {
+      _domEventInvoke(target, event, true, 2);
+      if (!event._immediatePropagationStopped) {
+        _domEventInvoke(target, event, false, 2);
+      }
+    }
+
+    if (event.bubbles && !event._propagationStopped) {
+      for (const currentTarget of path) {
+        _domEventInvoke(currentTarget, event, false, 3);
+        if (event._propagationStopped) break;
+      }
+    }
+    return !event.defaultPrevented;
+  } finally {
+    event.currentTarget = null;
+    event.eventPhase = 0;
+    event._dispatching = false;
+  }
 }
 
 // During custom-element upgrade, HTMLElement's constructor must return the
@@ -3773,44 +3869,13 @@ class Element extends Node {
     return null;
   }
   addEventListener(type, handler, opts) {
-    const key = this._nid;
-    if (!_eventRegistry[key]) _eventRegistry[key] = {};
-    if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
-    _eventRegistry[key][type].push(handler);
+    _eventTargetAdd(this, type, handler, opts);
   }
-  removeEventListener(type, handler) {
-    const key = this._nid;
-    if (_eventRegistry[key] && _eventRegistry[key][type]) {
-      _eventRegistry[key][type] = _eventRegistry[key][type].filter(h => h !== handler);
-    }
+  removeEventListener(type, handler, opts) {
+    _eventTargetRemove(this, type, handler, opts);
   }
   dispatchEvent(event) {
-    if (!event) return true;
-    if (!event.target) event.target = this;
-    event.currentTarget = this;
-    // Spec: inline `onclick="..."` content attributes are event handlers
-    // for the matching event type. Fire them alongside any
-    // addEventListener handlers. Also honor the IDL property
-    // `el.onclick = fn` if set. Without this, b.click() never invokes
-    // the inline handler and forms with onsubmit / buttons with onclick
-    // are silently dead.
-    const handlerName = 'on' + event.type;
-    const inlineFn = this[handlerName] || this._resolveInlineHandler(handlerName);
-    if (typeof inlineFn === 'function') {
-      try {
-        const ret = inlineFn.call(this, event);
-        if (ret === false) event.preventDefault();
-      } catch(e) { console.error(e); }
-    }
-    const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
-    for (const h of handlers) {
-      try { h.call(this, event); } catch(e) { console.error(e); }
-      if (event._immediatePropagationStopped) break;
-    }
-    if (event.bubbles && !event._propagationStopped && this.parentNode) {
-      this.parentNode.dispatchEvent(event);
-    }
-    return !event.defaultPrevented;
+    return _domEventDispatch(this, event);
   }
   _resolveInlineHandler(name) {
     // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
@@ -3926,8 +3991,24 @@ class Element extends Node {
       }
     }
   }
-  focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
-  blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
+  focus() {
+    const previous = globalThis.__obscura_focused || null;
+    if (previous === this) return;
+    if (previous) {
+      previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: this })));
+      previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })));
+    }
+    globalThis.__obscura_focused = this;
+    globalThis.__obscura_click_target = this;
+    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: previous })));
+    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })));
+  }
+  blur() {
+    if (globalThis.__obscura_focused !== this) return;
+    globalThis.__obscura_focused = null;
+    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: null })));
+    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: null })));
+  }
 
   // --- Popover API (HTML "popover") ---------------------------------------
   // Read the popover content attribute case-insensitively. The HTML parser
@@ -4699,8 +4780,48 @@ class Element extends Node {
     if (this._isViewportRoot()) return globalThis.innerHeight || 720;
     return this.getBoundingClientRect().height;
   }
-  get offsetTop() { return this.getBoundingClientRect().top; }
-  get offsetLeft() { return this.getBoundingClientRect().left; }
+  get offsetParent() {
+    if (!this.isConnected || this._renderBoxGeometry() === null) return null;
+    const ownStyle = globalThis.getComputedStyle(this);
+    if (ownStyle.position === 'fixed') return null;
+
+    for (let ancestor = this.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.tagName === 'HTML') break;
+      const style = globalThis.getComputedStyle(ancestor);
+      if (style.display === 'none') return null;
+      if (ancestor.tagName === 'BODY' || style.position !== 'static'
+          || style.display === 'table-cell' || style.display === 'table') {
+        return ancestor;
+      }
+    }
+    return document.body || null;
+  }
+  get offsetTop() {
+    if (!this.isConnected || this._renderBoxGeometry() === null) return 0;
+    const rect = this.getBoundingClientRect();
+    const parent = this.offsetParent;
+    const value = parent
+      ? rect.top - parent.getBoundingClientRect().top - parent.clientTop
+      : rect.top + (globalThis.scrollY || 0);
+    return Math.round(value);
+  }
+  get offsetLeft() {
+    if (!this.isConnected || this._renderBoxGeometry() === null) return 0;
+    const rect = this.getBoundingClientRect();
+    const parent = this.offsetParent;
+    const value = parent
+      ? rect.left - parent.getBoundingClientRect().left - parent.clientLeft
+      : rect.left + (globalThis.scrollX || 0);
+    return Math.round(value);
+  }
+  get clientTop() {
+    if (!this.isConnected || this._renderBoxGeometry() === null) return 0;
+    return Math.round(Math.max(0, parseFloat(globalThis.getComputedStyle(this).borderTopWidth) || 0));
+  }
+  get clientLeft() {
+    if (!this.isConnected || this._renderBoxGeometry() === null) return 0;
+    return Math.round(Math.max(0, parseFloat(globalThis.getComputedStyle(this).borderLeftWidth) || 0));
+  }
   // In standards mode documentElement exposes viewport client geometry.
   // Puppeteer's #clickableBox clips boxes to those dimensions; returning the
   // non-render fallback 100x20 there makes every element appear off-screen.
@@ -4768,6 +4889,10 @@ class Element extends Node {
     };
     Object.defineProperty(rect, "__obscuraViewportFixed", {
       value: !!geometry.viewportFixed,
+      enumerable: false,
+    });
+    Object.defineProperty(rect, "__obscuraPointerEventsNone", {
+      value: !!geometry.pointerEventsNone,
       enumerable: false,
     });
     return rect;
@@ -5630,21 +5755,13 @@ class Document extends Node {
   }
   createRange() { return new Range(); }
   addEventListener(type, fn, opts) {
-    if (typeof fn !== 'function') return;
-    if (!this._listeners) this._listeners = {};
-    if (!this._listeners[type]) this._listeners[type] = [];
-    if (!this._listeners[type].includes(fn)) this._listeners[type].push(fn);
+    _eventTargetAdd(this, type, fn, opts);
   }
-  removeEventListener(type, fn) {
-    if (this._listeners?.[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== fn);
-    }
+  removeEventListener(type, fn, opts) {
+    _eventTargetRemove(this, type, fn, opts);
   }
   dispatchEvent(event) {
-    if (!event) return true;
-    const handlers = (this._listeners?.[event.type] || []).slice();
-    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error('document event error:', e); } }
-    return !event.defaultPrevented;
+    return _domEventDispatch(this, event);
   }
   createTreeWalker(root, whatToShow, filter) {
     // whatToShow is unsigned long; default SHOW_ALL only when the arg is omitted.
@@ -10047,7 +10164,7 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
   try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
 };
 globalThis.Event = class Event {
-  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=performance.now();this._dispatching=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return _trustedEvents.has(this); }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
@@ -10074,7 +10191,29 @@ globalThis.CustomEvent = class extends Event {
   }
 };
 globalThis.MouseEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null; }
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null;this.movementX=o.movementX||0;this.movementY=o.movementY||0; }
+  get pageX() { return this.clientX + (globalThis.scrollX || 0); }
+  get pageY() { return this.clientY + (globalThis.scrollY || 0); }
+  get x() { return this.clientX; }
+  get y() { return this.clientY; }
+  get which() { return this.button + 1; }
+  get offsetX() {
+    const rect = this.target?.getBoundingClientRect?.();
+    return rect ? this.clientX - rect.left : this.clientX;
+  }
+  get offsetY() {
+    const rect = this.target?.getBoundingClientRect?.();
+    return rect ? this.clientY - rect.top : this.clientY;
+  }
+  getModifierState(key) {
+    switch (String(key)) {
+      case 'Alt': return this.altKey;
+      case 'Control': return this.ctrlKey;
+      case 'Meta': return this.metaKey;
+      case 'Shift': return this.shiftKey;
+      default: return false;
+    }
+  }
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initMouseEvent(type,canBubble,cancelable,view,detail,screenX,screenY,clientX,clientY,ctrlKey,altKey,shiftKey,metaKey,button,relatedTarget) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initMouseEvent' on 'MouseEvent': 1 argument required, but only 0 present.");
@@ -10095,6 +10234,15 @@ globalThis.MouseEvent = class extends Event {
 };
 globalThis.KeyboardEvent = class extends Event {
   constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat; }
+  getModifierState(key) {
+    switch (String(key)) {
+      case 'Alt': return this.altKey;
+      case 'Control': return this.ctrlKey;
+      case 'Meta': return this.metaKey;
+      case 'Shift': return this.shiftKey;
+      default: return false;
+    }
+  }
   // Legacy DOM Level 3 initializer. Positional signature per the WebKit/Gecko form.
   initKeyboardEvent(type,canBubble,cancelable,view,key,location,ctrlKey,altKey,shiftKey,metaKey) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initKeyboardEvent' on 'KeyboardEvent': 1 argument required, but only 0 present.");
@@ -10111,7 +10259,19 @@ globalThis.KeyboardEvent = class extends Event {
 globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
-globalThis.PointerEvent = class extends Event { constructor(t,o={}) { super(t,o); } };
+globalThis.PointerEvent = class extends MouseEvent {
+  constructor(t,o={}) {
+    super(t,o);
+    this.pointerId=o.pointerId===undefined?0:o.pointerId;
+    this.width=o.width===undefined?1:o.width;
+    this.height=o.height===undefined?1:o.height;
+    this.pressure=o.pressure===undefined?0:o.pressure;
+    this.tangentialPressure=o.tangentialPressure||0;
+    this.tiltX=o.tiltX||0;this.tiltY=o.tiltY||0;this.twist=o.twist||0;
+    this.pointerType=o.pointerType===undefined?'':String(o.pointerType);
+    this.isPrimary=!!o.isPrimary;
+  }
+};
 globalThis.AnimationEvent = class extends Event {};
 globalThis.TransitionEvent = class extends Event {};
 globalThis.UIEvent = class extends Event {
@@ -12167,6 +12327,18 @@ function _ensureWindowNamedProperty(name) {
   try {
     Object.defineProperty(globalThis, name, {
       get() { return _windowNamedValue(name); },
+      set(value) {
+        // A named element is a legacy platform property, not a read-only
+        // Window attribute. An ordinary assignment shadows it with an own
+        // data property, including in strict-mode bootstrap scripts.
+        _windowNamedPropertyNames.delete(name);
+        Object.defineProperty(globalThis, name, {
+          value,
+          writable: true,
+          configurable: true,
+          enumerable: true,
+        });
+      },
       configurable: true,
       enumerable: true,
     });
@@ -15359,10 +15531,8 @@ if (typeof Element !== 'undefined' && !Element.prototype.toggleAttribute) {
   };
 }
 
-// Document.elementFromPoint / elementsFromPoint — no layout engine, so this is a stub:
-// in-viewport coords return <body> (or <html> as fallback), out-of-viewport returns null.
-// Wrong-but-non-throwing beats "undefined", which traps ad/analytics bootstraps in retry loops
-// (see issue #63).
+// Document.elementFromPoint / elementsFromPoint. Render builds use the retained
+// layout tree; no-render builds keep the synthetic-geometry fallback below.
 if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // Real hit testing against the synthetic bboxes from getBoundingClientRect.
   // Flat iteration over every element, NOT a tree walk: our synthetic rects
@@ -15378,6 +15548,17 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
     var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
     if (x < 0 || y < 0 || x > w || y > h) return null;
+    if (typeof __obscuraCore.ops.op_layout_hit_test === 'function') {
+      var hitNid = __obscuraCore.ops.op_layout_hit_test(x, y);
+      if (hitNid >= 0) {
+        var hit = _wrapEl(hitNid);
+        return hit === this.documentElement && this.body ? this.body : hit;
+      }
+      // The root canvas still belongs to the document when no descendant box
+      // is hit. Preserve the long-standing in-viewport fallback used by pages
+      // before renderer-backed hit testing was available.
+      return this.body || this.documentElement || null;
+    }
     var all = this.querySelectorAll('*');
     var best = null;
     var bestNid = -1;
@@ -15389,6 +15570,10 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       if (el === this.documentElement || el === this.body) continue;
       var r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
+      // The renderer resolves this inherited property and carries it with the
+      // existing geometry read, avoiding another native call per candidate.
+      if (r.__obscuraPointerEventsNone ||
+          (!('__obscuraPointerEventsNone' in r) && el.style?.pointerEvents === 'none')) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
         // A descendant's layout rect can extend beyond an overflow clip. It
         // must not win hit testing where its scrolling ancestor hides it —
