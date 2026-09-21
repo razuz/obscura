@@ -937,6 +937,77 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
 /// - HTTP (`GET /json/*`): serve synchronously via blocking I/O so the
 ///   response is never stalled by the LocalSet.
 /// - WebSocket: forward to the LocalSet for CDP processing.
+
+// ---------------------------------------------------------------------------
+// Hard deadline for a wedged CDP command.
+//
+// A synchronous hang inside a Rust op invoked from page JS cannot be cancelled
+// by tokio (there is no await to interrupt) nor by the V8 watchdog
+// (terminate_execution only unwinds JS bytecode, not native Rust running
+// beneath a V8->op call). `obscura fetch` already carries a process-level
+// backstop for exactly this case (see obscura-cli/src/main.rs); `serve` did
+// not, so a pathological page pinned an `obscura-cdp-conn` thread at 100% CPU
+// indefinitely.
+//
+// Measured 2026-09-20 over a 1000-url run: two connection threads burned 3073s
+// and 2505s of CPU and never returned. The CLIENT's own 60s timeout did NOT
+// help -- Playwright gave up and recorded a timeout while the thread kept
+// spinning. Nothing reclaims them, so over a long crawl they accumulate until
+// the process is doing no useful work at full CPU.
+//
+// A thread stuck in native code cannot be killed safely in Rust, so the only
+// reliable escape is exiting the process. `serve` runs one navigation at a time
+// per process, so this costs at most the in-flight page, and any supervisor
+// (systemd Restart=, docker restart policy) brings it straight back. Loud on
+// the way out, because the previous behaviour was silent.
+static CMD_STARTED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CMD_WATCHDOG: std::sync::Once = std::sync::Once::new();
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Seconds a single CDP command may run before the process is considered wedged.
+/// 0 disables the backstop entirely.
+fn command_deadline_s() -> u64 {
+    std::env::var("OBSCURA_CDP_COMMAND_DEADLINE_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180)
+}
+
+fn ensure_command_watchdog() {
+    CMD_WATCHDOG.call_once(|| {
+        let deadline = command_deadline_s();
+        if deadline == 0 {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("obscura-cmd-watchdog".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let started = CMD_STARTED_MS.load(std::sync::atomic::Ordering::Relaxed);
+                if started == 0 {
+                    continue;
+                }
+                let elapsed = now_ms().saturating_sub(started);
+                if elapsed >= deadline * 1000 {
+                    eprintln!(
+                        "obscura: CDP command exceeded {}s and cannot be interrupted \
+                         (native hang beneath a V8 op); forcing exit so a supervisor \
+                         can restart a usable process",
+                        deadline
+                    );
+                    std::process::exit(124);
+                }
+            })
+            .ok();
+    });
+}
+
 fn accept_dispatch(
     stream: std::net::TcpStream,
     bind_ip: std::net::IpAddr,
@@ -1825,7 +1896,12 @@ async fn process_cdp_message(
     tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
 
     service_live_page_render_resources(ctx);
+    // Mark this command in flight so the watchdog can tell a slow page from a
+    // wedged one. Cleared below whether dispatch returns or errors.
+    ensure_command_watchdog();
+    CMD_STARTED_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     let response = dispatch::dispatch(&req, ctx).await;
+    CMD_STARTED_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     service_live_page_render_resources(ctx);
 
     // Chromium CDP semantics: events emitted as a side-effect of a command

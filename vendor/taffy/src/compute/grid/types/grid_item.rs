@@ -164,7 +164,17 @@ impl GridItem {
     /// excluding the lines that bound it.
     pub fn track_range_excluding_lines(&self, axis: AbstractAxis) -> Range<usize> {
         let indexes = self.placement_indexes(axis);
-        (indexes.start as usize + 1)..(indexes.end as usize)
+        let start = indexes.start as usize + 1;
+        // `start` is `placement.start + 1`, so a placement whose start and end
+        // coincide (a degenerate item spanning no tracks) yields start > end and
+        // every `axis_tracks[..]` slice below panics with "slice index starts at
+        // N but ends at N-1". Because these run inside `#[op2]` V8 ops, which
+        // cannot unwind, that panic ABORTS THE WHOLE PROCESS rather than failing
+        // one layout -- one hostile CSS grid takes down every page in flight.
+        // An item spanning no tracks contributes nothing, so the correct
+        // degenerate result is an EMPTY range.
+        let end = (indexes.end as usize).max(start);
+        start..end
     }
 
     /// Returns the number of tracks that this item spans in the specified axis

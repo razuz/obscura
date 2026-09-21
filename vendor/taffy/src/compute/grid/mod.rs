@@ -656,11 +656,20 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
 
     // Position in-flow children (stored in items vector)
     for (index, item) in items.iter_mut().enumerate() {
+        // Clamp every track lookup to the tracks that actually exist. A
+        // degenerate placement (start/end at or past the track count) otherwise
+        // indexes one past the end -- "index out of bounds: the len is 13 but
+        // the index is 13" -- and because grid layout runs inside `#[op2]` V8
+        // ops, which cannot unwind, that panic ABORTS THE PROCESS instead of
+        // failing one layout. Positioning such an item at the grid edge is a
+        // degraded result; killing every page in flight is not.
+        let last_row = rows.len().saturating_sub(1);
+        let last_col = columns.len().saturating_sub(1);
         let grid_area = Rect {
-            top: rows[item.row_indexes.start as usize + 1].offset,
-            bottom: rows[item.row_indexes.end as usize].offset,
-            left: columns[item.column_indexes.start as usize + 1].offset,
-            right: columns[item.column_indexes.end as usize].offset,
+            top: rows[(item.row_indexes.start as usize + 1).min(last_row)].offset,
+            bottom: rows[(item.row_indexes.end as usize).min(last_row)].offset,
+            left: columns[(item.column_indexes.start as usize + 1).min(last_col)].offset,
+            right: columns[(item.column_indexes.end as usize).min(last_col)].offset,
         };
         #[cfg_attr(not(feature = "content_size"), allow(unused_variables))]
         let (content_size_contribution, y_position, height) = align_and_position_item(
